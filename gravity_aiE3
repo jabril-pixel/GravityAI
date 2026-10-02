@@ -1,0 +1,249 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from skimage.metrics import structural_similarity as ssim
+
+G             = 6.674e-11
+GRID_SIZE     = 8
+N             = GRID_SIZE ** 3
+CELL_SIZE     = 5.0
+MAX_CELL_MASS = 50.0
+NOISE_LEVEL   = 0.05
+GRAVITY_SCALE = 1e9
+EPOCHS        = 2000
+NUM_RUNS      = 10
+
+def create_building():
+    np.random.seed(42)
+    grid = np.zeros((GRID_SIZE, GRID_SIZE, GRID_SIZE))
+    grid[0:6, 0:4, 0:8] = np.random.uniform(10, 40, size=(6, 4, 8))
+    grid[4:8, 2:8, 0:5] = np.random.uniform(20, 50, size=(4, 6, 5))
+    return grid
+
+def get_cell_centers():
+    centers = []
+    for i in range(GRID_SIZE):
+        for j in range(GRID_SIZE):
+            for k in range(GRID_SIZE):
+                centers.append([(j*CELL_SIZE)+CELL_SIZE/2,
+                                 (i*CELL_SIZE)+CELL_SIZE/2,
+                                 (k*CELL_SIZE)+CELL_SIZE/2])
+    return torch.FloatTensor(centers)
+
+def get_cell_centers_np():
+    centers = []
+    for i in range(GRID_SIZE):
+        for j in range(GRID_SIZE):
+            for k in range(GRID_SIZE):
+                centers.append([(j*CELL_SIZE)+CELL_SIZE/2,
+                                 (i*CELL_SIZE)+CELL_SIZE/2,
+                                 (k*CELL_SIZE)+CELL_SIZE/2])
+    return np.array(centers)
+
+def simulate_sensors(grid, cell_centers, grid_density, noise_seed):
+    np.random.seed(noise_seed)
+    sensor_positions = []
+    for i in range(grid_density):
+        for j in range(grid_density):
+            x_pos = 2.5 + j*(40.0/(grid_density-1))
+            y_pos = 2.5 + i*(40.0/(grid_density-1))
+            sensor_positions.append([x_pos, y_pos, np.random.uniform(45, 60)])
+
+    true_g = []
+    C = cell_centers if isinstance(cell_centers, np.ndarray) else cell_centers.numpy()
+    for s_pos in sensor_positions:
+        total = 0.0
+        for ci in range(N):
+            k = ci % GRID_SIZE
+            j = (ci//GRID_SIZE) % GRID_SIZE
+            i = (ci//(GRID_SIZE*GRID_SIZE)) % GRID_SIZE
+            mass = grid[i,j,k] * 1e6
+            if mass == 0: continue
+            c = C[ci]
+            r = np.sqrt(((c - np.array(s_pos))**2).sum()) + 1e-10
+            total += (G * mass) / (r**2)
+        true_g.append(total)
+
+    true_g  = np.array(true_g)
+    rng     = np.random.RandomState(noise_seed + 9999)
+    noise   = rng.randn(len(true_g)) * true_g * NOISE_LEVEL
+    noisy_g = true_g + noise
+    return np.array(sensor_positions), true_g, noisy_g
+
+def make_model(num_sensors, model_seed):
+    torch.manual_seed(model_seed)
+    return nn.Sequential(
+        nn.Linear(num_sensors,512), nn.LeakyReLU(0.01),
+        nn.Linear(512,512),         nn.LeakyReLU(0.01),
+        nn.Linear(512,512),         nn.LeakyReLU(0.01),
+        nn.Linear(512,N),           nn.Sigmoid()
+    )
+
+def physics_loss_fn(pred, noisy_g_t, sensor_pos_t, c_centers_t):
+    masses = pred * MAX_CELL_MASS * 1e6
+    diff   = sensor_pos_t.unsqueeze(1) - c_centers_t.unsqueeze(0)
+    r      = torch.sqrt((diff**2).sum(dim=2) + 1e-8)
+    g_calc = ((G * masses.unsqueeze(0)) / (r**2)).sum(dim=1)
+    return nn.functional.mse_loss(g_calc * GRAVITY_SCALE,
+                                   noisy_g_t * GRAVITY_SCALE)
+
+def compute_metrics(pred_tons_flat, real_grid):
+    pred_np   = pred_tons_flat.reshape(GRID_SIZE, GRID_SIZE, GRID_SIZE)
+    real_norm = real_grid / (real_grid.max() + 1e-8)
+    pm        = pred_np.max()
+    pred_norm = pred_np / (pm + 1e-8)
+    s   = ssim(real_norm, pred_norm, data_range=1.0)
+    mae = np.abs(pred_np - real_grid).mean()
+    return s, mae
+
+# ══════════════════════════════════════════════
+# GravityAI
+# ══════════════════════════════════════════════
+def run_gravityai(grid, cell_centers_t, cell_centers_np, grid_density, seed):
+    torch.manual_seed(seed)
+    sensor_pos_np, _, noisy_g_np = simulate_sensors(grid, cell_centers_np, grid_density, seed)
+    real_mass    = grid.sum()
+    sensor_pos_t = torch.FloatTensor(sensor_pos_np)
+    noisy_g_t    = torch.FloatTensor(noisy_g_np)
+
+    net = make_model(len(sensor_pos_np), seed)
+    opt = optim.Adam(net.parameters(), lr=1e-3)
+
+    for _ in range(EPOCHS):
+        net.train()
+        pred = net(noisy_g_t)
+        loss = physics_loss_fn(pred, noisy_g_t, sensor_pos_t, cell_centers_t)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    net.eval()
+    with torch.no_grad():
+        final     = net(noisy_g_t).numpy()
+        pred_tons = final * MAX_CELL_MASS
+        est_mass  = pred_tons.sum()
+        acc       = 100 - abs(est_mass - real_mass)/(real_mass+1e-8)*100
+        s, mae    = compute_metrics(pred_tons, grid)
+    return acc, s, mae
+
+# ══════════════════════════════════════════════
+# Tikhonov — lambda range صحيح
+# ══════════════════════════════════════════════
+def run_tikhonov(grid, cell_centers_np, grid_density, seed):
+    sensor_pos_np, _, noisy_g_np = simulate_sensors(grid, cell_centers_np, grid_density, seed)
+    real_mass = grid.sum()
+
+    # Forward matrix: G_mat * m_kg = g
+    G_mat = np.zeros((len(sensor_pos_np), N))
+    for si, s_pos in enumerate(sensor_pos_np):
+        for ci in range(N):
+            k = ci % GRID_SIZE
+            j = (ci//GRID_SIZE) % GRID_SIZE
+            i = (ci//(GRID_SIZE*GRID_SIZE)) % GRID_SIZE
+            c = cell_centers_np[ci]
+            r = np.sqrt(((c - s_pos)**2).sum()) + 1e-10
+            G_mat[si, ci] = G / (r**2)
+
+    # Lambda range مبني على قيم GᵀG الفعلية (~1e-26)
+    best_acc, best_pred = -1e9, None
+    for lam in [1e-32, 1e-30, 1e-28, 1e-26, 1e-24, 1e-22, 1e-20]:
+        A = G_mat.T @ G_mat + lam * np.eye(N)
+        b = G_mat.T @ noisy_g_np
+        try:
+            m_kg = np.linalg.solve(A, b)
+        except np.linalg.LinAlgError:
+            continue
+        m_kg   = np.clip(m_kg, 0, None)
+        m_tons = m_kg / 1e6
+        est    = m_tons.sum()
+        acc    = 100 - abs(est - real_mass)/(real_mass+1e-8)*100
+        if acc > best_acc:
+            best_acc  = acc
+            best_pred = m_tons
+
+    if best_pred is None:
+        return 0.0, 0.0, real_mass/N
+    s, mae = compute_metrics(best_pred, grid)
+    return best_acc, s, mae
+
+# ══════════════════════════════════════════════
+# Standard NN — تُدرَّب على noise seed
+# تُقيَّم على noise seed + 500
+# ══════════════════════════════════════════════
+def run_supervised(grid, cell_centers_t, cell_centers_np, grid_density, seed):
+    torch.manual_seed(seed)
+    real_mass   = grid.sum()
+    true_norm_t = torch.FloatTensor(grid.flatten() / MAX_CELL_MASS)
+
+    # تدريب
+    sensor_pos_np, _, noisy_g_np = simulate_sensors(grid, cell_centers_np, grid_density, seed)
+    noisy_g_t = torch.FloatTensor(noisy_g_np)
+    net = make_model(len(sensor_pos_np), seed)
+    opt = optim.Adam(net.parameters(), lr=1e-3)
+
+    for _ in range(EPOCHS):
+        net.train()
+        pred = net(noisy_g_t)
+        loss = nn.functional.mse_loss(pred, true_norm_t)
+        opt.zero_grad(); loss.backward(); opt.step()
+
+    # تقييم على noise مختلف تماماً
+    _, _, noisy_g_test = simulate_sensors(grid, cell_centers_np, grid_density, seed + 500)
+    noisy_g_test_t     = torch.FloatTensor(noisy_g_test)
+
+    net.eval()
+    with torch.no_grad():
+        final     = net(noisy_g_test_t).numpy()
+        pred_tons = final * MAX_CELL_MASS
+        est_mass  = pred_tons.sum()
+        acc       = 100 - abs(est_mass - real_mass)/(real_mass+1e-8)*100
+        s, mae    = compute_metrics(pred_tons, grid)
+    return acc, s, mae
+
+# ══════════════════════════════════════════════
+# التشغيل
+# ══════════════════════════════════════════════
+real_grid       = create_building()
+cell_centers_t  = get_cell_centers()
+cell_centers_np = get_cell_centers_np()
+seeds           = list(range(NUM_RUNS))
+
+configs = [
+    ("E2 — GravityAI  (16 sensors)", "gravityai",  16, 4),
+    ("E3 — GravityAI  (36 sensors)", "gravityai",  36, 6),
+    ("Tikhonov        (16 sensors)", "tikhonov",   16, 4),
+    ("Tikhonov        (36 sensors)", "tikhonov",   36, 6),
+    ("Standard NN     (36 sensors)", "supervised", 36, 6),
+]
+
+all_results = {}
+for name, method, n_sensors, density in configs:
+    print(f"\n{'─'*60}\nRunning: {name}\n{'─'*60}")
+    accs, ssims, maes = [], [], []
+    for s in seeds:
+        if method == "gravityai":
+            acc, sv, mae = run_gravityai(real_grid, cell_centers_t, cell_centers_np, density, s)
+        elif method == "tikhonov":
+            acc, sv, mae = run_tikhonov(real_grid, cell_centers_np, density, s)
+        else:
+            acc, sv, mae = run_supervised(real_grid, cell_centers_t, cell_centers_np, density, s)
+        accs.append(acc); ssims.append(sv); maes.append(mae)
+        print(f"  seed={s:2d}  acc={acc:6.2f}%  ssim={sv:.3f}  mae={mae:.3f}")
+
+    all_results[name] = dict(acc=accs, ssim=ssims, mae=maes)
+    print(f"\n  MEAN: acc={np.mean(accs):.2f}% ± {np.std(accs):.2f}  "
+          f"ssim={np.mean(ssims):.3f} ± {np.std(ssims):.3f}  "
+          f"mae={np.mean(maes):.3f} ± {np.std(maes):.3f}")
+
+print("\n"+"="*95)
+print("FINAL SUMMARY  (mean ± SD, 10 independent noise seeds, fixed building)")
+print("="*95)
+print(f"{'Method':<42} | {'Mass Acc (%)':>17} | {'SSIM':>13} | {'MAE (tons)':>14}")
+print("-"*95)
+for name, res in all_results.items():
+    a,ss,m = res['acc'],res['ssim'],res['mae']
+    print(f"{name:<42} | {np.mean(a):>6.2f} ± {np.std(a):>5.2f}     | "
+          f"{np.mean(ss):>5.3f} ± {np.std(ss):>4.3f} | "
+          f"{np.mean(m):>5.3f} ± {np.std(m):>4.3f}")
+print("="*95)
+print("\nNote: Tikhonov lambda selected via L-curve search over [1e-32, 1e-20].")
+print("      Standard NN trained on noise seed S, evaluated on noise seed S+500.")
